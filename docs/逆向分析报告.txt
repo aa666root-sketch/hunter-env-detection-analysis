@@ -1,0 +1,635 @@
+﻿================================================================================
+  Hunter（com.zhenxi.hunter）反向分析报告
+  —— 环境检测机制拆解 + 缺陷与绕过面
+================================================================================
+  样本        : com.zhenxi.hunter.App.apk
+  SHA256      : a91d1a11539626dec702310d9717205e99cd536635fc23f086a6b23698d96391
+  大小        : 12,986,158 字节
+  包名        : com.zhenxi.hunter
+  版本        : versionName 6.42 / versionCode 642
+  SDK         : minSdk 28  /  targetSdk 36  /  compileSdk 36
+  DEX 类数    : 6688
+  资源数      : 781
+  分析工具    : REA + JADX headless 0.7.1（静态，样本未执行）
+  分析日期    : 2026-11-20
+================================================================================
+
+
+--------------------------------------------------------------------------------
+目录
+--------------------------------------------------------------------------------
+  1. 结论速览
+  2. 应用结构：三进程 + App Zygote
+  3. 检测体系（四层）
+     3.1 Java 层检测入口
+     3.2 Native 层检测点（libhunter.so）
+     3.3 规则库与数据文件
+     3.4 云端与第三方 SDK
+  4. 检测链时序还原
+  5. 缺陷与绕过面（按危害排序）
+     5.1 【高】明文 HTTP 更新通道，可下发任意 APK
+     5.2 【高】native 用 popen 调 shell，PATH 可劫持
+     5.3 【高】检测实现全部动态注册，单点失效
+     5.4 【中】导出组件与自定义 scheme
+     5.5 【中】profileable shell=true 泄露内部
+     5.6 【中】规则库 ZipCrypto 加密，已知明文可破
+     5.7 【低】maps 自隐藏与 maps 检测自相矛盾
+     5.8 【低】单 IP 无备份、无证书绑定
+  6. 证据与复现
+  7. 待展开项
+  8. 附：检测项总表
+================================================================================
+
+
+================================================================================
+1. 结论速览
+================================================================================
+
+一句话：Hunter 是一个「三进程 + App Zygote 预热 + 65 个 native 检测方法 + 25 MB
+加密规则库」的重量级环境检测器，检测覆盖面在同类工具里属于第一梯队（root / 注入 /
+hook / 调试 / 沙箱 / 虚拟定位 / 自动化脚本全覆盖）。
+
+它的检测强，但工程上留了三个硬伤：
+
+  ① 更新通道是 http 明文 + 硬编码 IP + 装包权限 —— 可以中间人下发 APK
+  ② native 侧用 popen 执行 shell，PATH 一旦被污染，检测结果由攻击者决定
+  ③ 65 个检测方法全部靠 RegisterNatives 动态注册，hook 一处即全盘失效
+
+三条里 ① 是安全漏洞，② ③ 是检测可靠性缺陷（对「被测方」而言是最实用的绕过点）。
+
+
+================================================================================
+2. 应用结构：三进程 + App Zygote
+================================================================================
+
+从 AndroidManifest 还原的进程模型：
+
+  +---------------------------+----------------------------+--------------------------------+
+  | 进程                      | 组件                       | 属性                           |
+  +---------------------------+----------------------------+--------------------------------+
+  | :hunter_main_process      | com.zhenxi.hunter.App      | 主进程，UI 与 Java 层调度      |
+  |                           |                            | zygotePreloadName=.HunterPreload|
+  +---------------------------+----------------------------+--------------------------------+
+  | :hunter_server_iso        | ZhenxiServer               | isolatedProcess=true           |
+  |                           |                            | 独立 UID，无权限、无存储       |
+  +---------------------------+----------------------------+--------------------------------+
+  | :hunter_server_twin       | ZhenxiServerTwin           | useAppZygote=true              |
+  |                           |                            | 由 App Zygote fork，预热载入   |
+  +---------------------------+----------------------------+--------------------------------+
+
+为什么要这么设计：
+
+  - 隔离进程（isolatedProcess）拿不到应用权限，能测出「低权限下能否看到 root 痕迹」，
+    这比带权限的自测更接近第三方风控的真实视角
+  - App Zygote（useAppZygote + zygotePreloadName）在 fork 前就把 ClassLoader 和
+    native 库装好，检测在 fork 之后的干净进程里跑，**常规的应用内 hook 打不到**
+  - 三进程互相比对：主进程、隔离进程、twin 进程各自采集一份，结果不一致即视为异常
+    （native 字符串里的 "check two error ,process name no match" 就是这条判据）
+
+进程间通信用 AIDL：
+
+      com.zhenxi.aidl.IZhenxServer
+      com.zhenxi.hunter.ZhenxiServerIpc
+      com.zhenxi.hunter.ZhenxiServerTwinIpc
+
+两个 Server 组件都是 exported=false，外部应用直接 bind 不通。
+
+
+================================================================================
+3. 检测体系（四层）
+================================================================================
+
+3.1 Java 层检测入口
+--------------------------------------------------------------------------------
+
+核心类：com.zhenxi.hunter.NativeEngine（单类 65 个方法）
+
+按用途分类（方法名即语义，作者没有混淆）：
+
+  【root】
+      checkRootFromAVCLog          读 logcat 的 "avc: denied" 判定 SELinux 拦截
+      checkRiskFile                风险文件存在性
+      getZhenxiInfoSH              Shell / su 相关
+
+  【注入 / hook】
+      getZhenxiInfoInjection       注入检测
+      getZhenxiInfoMapELF          /proc/self/maps 里的可疑 ELF
+      getZhenxiInfoNHIL            Native Hook 清单
+      getZhenxiInfoOFLI / OFRL     打开文件 / 映射文件清单
+      getZhenxiInfoMethodCode      方法体校验（比对 DEX 中的 code item）
+      check_jvm_method(Method)     单个 Java 方法是否被 hook
+      getZhenxiInfoMM              ART 方法入口点一致性
+
+  【zygisk / zygote】
+      checkZygisk
+      checkFromZygote              从 Zygote 侧回看
+      runInZygisk                  主动进 zygisk 环境采样
+
+  【调试】
+      DetectHardwareBreakpoints    ptrace 硬件断点扫描
+      getZhenxiInfoCBinder         Binder 调用链检查
+
+  【模拟器 / 改机 / 多开】
+      getCPUFingerprinting         CPU 指纹（架构 + 核心数 + 特性）
+      getZhenxiInfoEnv             运行环境
+      getZhenxiInfoApkEnv          APK 运行环境
+      check sandbox（native 侧）
+
+  【网络 / 位置】
+      CheckVpn                     VPN 检测
+      getZhenxiLoctionCrc          定位数据 CRC（虚拟定位改机检测）
+
+  【自保护】
+      hideLinkerAndMaps            隐藏自身 so 在 linker 与 maps 中的痕迹
+      getZhenxiInfoReleaseNative   释放/清理 native 资源
+      getZhenxiInfoT / getZhenxiInfo9 等  清理与收尾
+
+另外还有一个独立库：
+
+      top.canyie.magiskkiller.SubprocessMain
+
+  MagiskKiller 是社区熟知的 Magisk 检测库，特性是**起一个独立子进程**做检测，
+  避免主进程被 hook 后检测失真。它和上面的 checkFromZygote 是同一个思路的两种实现。
+
+Xposed 检测在 Java 侧另有一条线，字符串留有：
+
+      antiXposed / antiXposed methodCache / antiXposed sHookedMethodCallbacks
+      checkXposedMark get xposed mark class / check xposed mark in mem
+      clean xposed hook item finish
+
+即：主动去翻 XposedBridge 的 method hook 回调表，翻到即判 hook。
+
+
+3.2 Native 层检测点（libhunter.so）
+--------------------------------------------------------------------------------
+
+libhunter.so = 3,561,456 字节。抽出的 ASCII 字符串 4,439 条，按类归并：
+
+  +----------------+--------------------------------------------------------------+
+  | 类别           | 代表性字符串（原文）                                         |
+  +----------------+--------------------------------------------------------------+
+  | Magisk 痕迹    | /sbin/.magisk、/data/adb/magisk、/cache/magisk.log           |
+  |                | /dev/magisk/img、/data/magisk.apk、/system/bin/magisk32      |
+  |                | /system/addon.d/99-magisk.sh、/cache/.disable_magisk         |
+  |                | Check Find Root Magisk Mode / Find Magisk Modules Mark       |
+  +----------------+--------------------------------------------------------------+
+  | 隐藏模块路径   | /sbin/.magisk/modules/zygisk_lsposed                         |
+  |                | /sbin/.magisk/modules/riru_lsposed                           |
+  |                | /sbin/.magisk/modules/riru_edxposed                          |
+  |                | /sbin/.magisk/modules/taichi                                 |
+  |                | /sbin/.magisk/modules/dreamland                              |
+  +----------------+--------------------------------------------------------------+
+  | KSU / APatch   | kernelSu、APatch、/data/adb/ap、/data/adb/ap/log/bin/apd     |
+  |                | /data/adb/ap/log/bin/magiskboot / magiskmount / magiskpolicy |
+  +----------------+--------------------------------------------------------------+
+  | 经典 root      | /system/xbin/su、/sbin/su、/vendor/xbin/su、/system/sd/xbin/su|
+  |                | /system/app/Superuser.apk、/system/.supersu                  |
+  |                | /dev/com.koushikdutta.superuser.daemon                        |
+  |                | /system/etc/init.d/99SuperSUDaemon、/system/xbin/sugote      |
+  +----------------+--------------------------------------------------------------+
+  | 注入 / Frida   | Find Frida Mark、Find Frida NAME PIPE(linjector)             |
+  |                | gum-js-loop、frida AntiReadText read/open error              |
+  |                | find libart.so hooked、Find Linker Is Hook、Find Hook Mark   |
+  |                | Find Mark ELF、find hook file、Check Linker Crc Error        |
+  |                | find inconsistent dalvik-zygote-jit-code-cache               |
+  +----------------+--------------------------------------------------------------+
+  | 调试           | ptrace、TracerPid、check ptrace thread setname fail          |
+  |                | UnwindStackPtrace、DetectHardwareBreakpoints                 |
+  |                | PTRACE_GETREGSET failed after setting                        |
+  +----------------+--------------------------------------------------------------+
+  | SELinux        | security.selinux、/sys/fs/selinux                            |
+  |                | /system/etc/selinux/plat_property_contexts                   |
+  |                | /vendor/etc/selinux/nonplat_property_contexts                |
+  |                | checkRootFileFromAVC、check base selinux context error       |
+  +----------------+--------------------------------------------------------------+
+  | 属性           | ro.boot.verifiedbootstate、ro.boot.vbmeta.device_state       |
+  |                | ro.boot.warranty_bit、ro.debuggable                          |
+  +----------------+--------------------------------------------------------------+
+  | 模拟器         | goldfish_pipe、goldfish_audio、genymotion、vboxguest、qemu   |
+  |                | ro.genymotion.version、ranchu                                |
+  +----------------+--------------------------------------------------------------+
+  | 自动化脚本     | /data/local/tmp/minicap、minitouch、uiautomator-stub.jar     |
+  |                | /data/local/tmp/shizuku、shizuku_starter                     |
+  |                | /data/local/tmp/mqc-scrcpy.jar、scrcpy-server.odex           |
+  |                | /data/local/tmp/txysvr.apk、libtxysvr.so                     |
+  |                | /data/local/tmp/juejinAzykb/TouchService.jar                 |
+  |                | /data/local/tmp/com.cyjh.mobileanjian.id（按键精灵）         |
+  |                | /data/local/tmp/vysor.pwd、cloudtesting/touchserver          |
+  +----------------+--------------------------------------------------------------+
+
+关键实现细节（从日志字符串还原）：
+
+  · 反 hook 用 DobbyHook 给自身关键函数下 inline hook，先手自保护
+  · 用 ptrace 起一个独立 tracer 线程（check ptrace thread start success !!!!）
+    既能查别人有没有在跟踪自己，也能监控自身代码页是否被改
+  · 用 UnwindStackPtrace 解调用栈，判定调用链是否来自异常模块
+  · Check Linker Crc Error / find linker is hooked：校验 linker 代码段 CRC
+  · find inconsistent dalvik-zygote-jit-code-cache：检查 JIT code cache 与
+    Zygote 镜像是否一致，专门针对 FART / 脱壳类内存篡改
+  · check apk sign path / inode / gid&uid：native 直接 fstat 自身 APK，
+    比 Java 层 getPackageInfo 更抗 hook —— 重打包会在这里露馅
+
+libhunter_maps_hide.so = 1,055,960 字节，函数名语义上就是「隐藏自己的 maps」，
+与 Java 侧 hideLinkerAndMaps 配套：检测器先把自己藏干净，再去看别人的脏东西。
+
+
+3.3 规则库与数据文件
+--------------------------------------------------------------------------------
+
+  assets/data.zip        1,784,210 字节
+      └─ data.json       25,427,761 字节（解压后）
+          加密方式：ZipCrypto（local header flag 0x000b，bit0=加密）
+          压缩方式：deflate（method 8），csize 1,784,026
+
+  YouAreLoser/*.properties   共 7.79 MB
+      文件名看起来像规则库，实际是 **BouncyCastle 的密码学参数资源**：
+        lowmcL1/L3/L5.properties  → LowMC 分组密码参数（Picnic 签名方案用）
+        p434 / p503 / p610.properties → SIKE 同源曲线参数
+        *.kotlin_builtins          → Kotlin 编译器内置定义
+      不是检测规则，属依赖膨胀，不参与检测逻辑。
+
+  assets/AndroidReverse.pdf  461,230 字节
+  assets/HunterRuntime.pdf   272,562 字节
+      作者自带的说明文档，直接打进 APK，分析时可以先读这两份。
+
+  assets/PublicSuffixDatabase.list  132,737 字节（okhttp 的公共后缀表）
+
+
+3.4 云端与第三方 SDK
+--------------------------------------------------------------------------------
+
+  更新与版本：
+      http://47.95.8.136:1111/update/checkVersion     （明文 HTTP，硬编码 IP）
+
+  第三方：
+      Firebase（Analytics / Crashlytics / Firestore / RemoteConfig / AppCheck）
+      Google Play Integrity（FirebaseAppCheckPlayIntegrityRegistrar）
+      小米安全 SDK：com.xiaomi.security.permission.ACCESS_XSOF
+                    + com.soter.permission.ACCESS_SOTER_KEYSTORE
+                    + uses-library soterkeystore
+                    + https://framework.sec.miui.com/framework/device/status
+      XUpdate（com.xuexiang.xupdate）—— 应用内更新框架
+      阿里云 IP 段 47.95.x.x —— 自建更新服务
+
+  说明：它一边检测别人有没有 hook，一边自己接了 Play Integrity 与小米 SOTER
+        （硬件密钥库），说明作者很清楚「检测器本身也会被检测」。
+
+
+================================================================================
+4. 检测链时序还原
+================================================================================
+
+  ① 用户点开 App
+       ↓
+  ② App Zygote 预热：HunterPreload 载入 ClassLoader 与 native 库
+       ↓
+  ③ fork 出 :hunter_server_twin（useAppZygote=true）
+     —— 此时进程干净，常规应用内 hook 不在
+       ↓
+  ④ 主进程 :hunter_main_process 启动，MainActivity 拉起 UI
+       ↓
+  ⑤ native 初始化：JNI_OnLoad → DobbyHook 自保护 → 起 ptrace tracer 线程
+       ↓
+  ⑥ bindService 到 :hunter_server_iso（isolatedProcess，低权限）
+       ↓
+  ⑦ 三进程分别调 NativeEngine 的 65 个方法做采样
+       ↓
+  ⑧ 比对三份结果：
+        - 结果不一致 → "check two error ,process name no match"
+        - 任一进程命中   → 该项判定为异常
+       ↓
+  ⑨ 需要联网的项目（版本、Play Integrity、小米 SDK）单独走网络
+       ↓
+  ⑩ 汇总成 ListItemBean 列表 → 列表页展示 → 可导出/分享
+
+  关键点：第 ③ 步是整个设计的核心。检测在 App Zygote fork 出来的进程里做，
+          比在应用主进程里做难绕得多。绕它要么在 zygote preload 阶段动手，
+          要么从 native 层（第 ⑤ 步之后、⑦ 步之前）介入。
+
+
+================================================================================
+5. 缺陷与绕过面
+================================================================================
+
+5.1 【高】明文 HTTP 更新通道，可下发任意 APK
+--------------------------------------------------------------------------------
+
+  证据链（三条，缺一不可）：
+
+  (1) AndroidManifest 声明了装包权限
+        android.permission.REQUEST_INSTALL_PACKAGES
+        android.permission.INSTALL_PACKAGES
+      并内嵌 XUpdate 框架（UpdateManager / DownloadService / UpdateFileProvider）
+
+  (2) 更新地址是明文 HTTP + 硬编码 IP
+        http://47.95.8.136:1111/update/checkVersion
+      同段字符串紧邻着 "checkUpdateInline error" 与 "versionCode / appKey"
+
+  (3) 网络安全配置全局放开明文
+      res 混淆后的 r/3A.xml（AXML 解析结果）：
+        <network-security-config>
+            <base-config cleartextTrafficPermitted="true"/>
+        </network-security-config>
+      targetSdk=36 默认禁明文，是这份配置自己把它放开的。
+
+  影响：
+      同一网络下的攻击者（公共 Wi-Fi、ARP 欺骗、运营商劫持、DNS 投毒）
+      可以伪造 checkVersion 响应，把版本号抬高，诱导 App 下载并安装攻击者的 APK。
+      XUpdate 默认只比对版本号，**不对下载到的 APK 做签名比对**，
+      装完就是完整权限接管（该 App 本身持有 READ_LOGS / QUERY_ALL_PACKAGES /
+      INSTALL_PACKAGES / 摄像头 / 定位等敏感权限）。
+
+      这条同时也污染检测结果：用了被投毒版本的检测器，结论不可信。
+
+  修复方向：
+      改 HTTPS + 证书绑定、对下载包做签名与 sha256 校验、把 base-config 收回去。
+
+  复现思路：
+      本机起 HTTP 服务，hosts 把 47.95.8.136 指向本机，返回抬高版本号的 JSON，
+      观察 App 是否进入下载流程（观察点：DownloadService、UpdateFileProvider）。
+
+
+5.2 【高】native 用 popen 调 shell，PATH 可劫持
+--------------------------------------------------------------------------------
+
+  证据：
+
+      NativeEngine.popen(String): String
+      NativeEngine.popen_list(String, String): ArrayList<String>
+      native 字符串：cat /proc/self/maps、grep /libc.so、logcat -d -b main ...
+
+           checkRootFromAVCLog 的实现依赖：
+             logcat -d -b main -b system -b events -b kernel | grep 'avc: denied'
+
+  问题：
+      popen 走 execvp 语义，按 PATH 查找可执行文件。Android 上 shell 的 PATH
+      通常包含 /system/bin、/system/xbin、/vendor/bin；部分定制 ROM、
+      或 root 后挂载的目录会把 /data/local/tmp 一类可写目录带进 PATH。
+
+      一旦被测环境能让 cat / grep / logcat 解析到攻击者放置的同名二进制，
+      检测器执行的就是攻击者的代码 —— 它输出的 maps、AVC 日志、进程列表
+      全由攻击者决定，检测结论直接反转。
+
+  这是本条报告里**最实用的一条绕过面**，因为它不需要碰 App 本身，
+  只需要污染被测设备的执行环境。
+
+  观察点：
+      在 /data/local/tmp 放一个同名脚本，比对 App 检测结果是否变化；
+      或 hook execvp / popen 记录它请求了哪些外部命令。
+
+
+5.3 【高】检测实现全部动态注册，单点失效
+--------------------------------------------------------------------------------
+
+  证据：
+
+      只有 2 个 Java_ 前缀导出符号：
+          Java_com_zhenxi_hunter_NativeEngine_getZhenxiInfoMethodCode
+          Java_com_zhenxi_hunter_NativeEngine_getZhenxiInfoReleaseNative
+
+      其余 63 个方法的实现全部通过 RegisterNatives 在 JNI_OnLoad 里动态绑定。
+
+  含义（双向的）：
+
+      对作者：动态注册让静态符号分析拿不到对应关系，增加逆向成本。
+      对攻击者：**所有检测的入口收敛到一个函数注册表**。
+               在 JNI_OnLoad 执行完之后 dump 这张表，
+               或用 inline hook 把 63 个函数指针统一替换成「返回未发现」的桩，
+               一次操作覆盖全部检测项。
+
+      这也是为什么它要在 JNI_OnLoad 里立刻 DobbyHook 自己 —— 作者显然
+      知道注册表是单点。但 DobbyHook 的初始化本身也是单点：
+      挂在 JNI_OnLoad 之前（例如在 zygote preload 阶段），
+      整套自保护就连同检测一起失效。
+
+  对应防御建议：把注册拆散到多个 so、多个时机，关键项用独立进程 + 独立校验。
+
+
+5.4 【中】导出组件与自定义 scheme
+--------------------------------------------------------------------------------
+
+  从 manifest 提取的导出面：
+
+  +-----------------------------------------------+--------+---------------------------+
+  | 组件                                          | 导出   | 说明                       |
+  +-----------------------------------------------+--------+---------------------------+
+  | com.zhenxi.hunter.MainActivity                | true   | singleTask，LAUNCHER      |
+  | com.google.firebase.auth.internal.            | true   | scheme=recaptcha://       |
+  |   RecaptchaActivity                           |        | host=firebase.auth        |
+  | com.google.firebase.auth.internal.            | true   | scheme=genericidp://      |
+  |   GenericIdpActivity                          |        | host=firebase.auth        |
+  | androidx.profileinstaller.ProfileInstallReceiver | true | 受 DUMP 权限保护        |
+  | com.google.android.gms.auth.api.signin.       | true   | 受自定义权限保护           |
+  |   RevocationBoundService                      |        |                           |
+  +-----------------------------------------------+--------+---------------------------+
+
+  MainActivity exported=true 且 singleTask：任意应用可以直接拉起它，
+  配合 task 复用可以做「检测结果截屏/覆盖」类钓鱼链
+  （例如目标 App 里跳到 Hunter 的界面，用户以为在看检测结果）。
+
+  Firebase 两个导出的 Activity 属 SDK 固有行为，风险有限，但
+  recaptcha:// / genericidp:// 这两个 scheme 没有注册独占性校验，
+  任何 App 都能抢注同名 scheme 做劫持，把用户引到钓鱼页。
+
+  两者都不是致命洞，但配合「环境检测 App 常被用来验真」这个场景，
+  社会工程价值不低。
+
+
+5.5 【中】profileable shell=true 泄露内部
+--------------------------------------------------------------------------------
+
+  manifest 里：
+
+      <profileable android:shell="true"/>
+      android:largeHeap="true"
+
+  Android 10+ 允许 shell 用 simpleperf / perfetto / heap dump 对
+  profileable 应用做剖析。这意味着 adb 连着的情况下，
+  可以从 shell 侧拿到方法调用采样、堆快照、native 调用栈，
+  直接暴露 NativeEngine 的调用顺序与规则库加载点。
+
+  对一个「自称检测环境」的工具来说，这是自己把内部结构摊开的做法。
+  正常做法是用 debuggable=false 且不声明 profileable。
+
+
+5.6 【中】规则库 ZipCrypto 加密，已知明文可破
+--------------------------------------------------------------------------------
+
+  证据（手工解析 assets/data.zip 的 local file header）：
+
+      ver=20  flag=0x000b  method=8
+      csize=1784026  usize=25427761  nlen=9  elen=28
+      name = data.json
+      dataStart = 67
+
+      flag bit0 = 1 → ZipCrypto（传统 PKWARE 加密），不是 AES-256
+
+  ZipCrypto 的问题：它是已知明文攻击的教科书案例。
+  攻击者手上只要有 12 字节已知明文 + 对应密文，就能反推密钥流，
+  然后用 bkcrack 一类工具还原整个 25 MB 的 data.json。
+
+  data.json 大概率是「检测规则 + 白名单 + 特征库」，拿到就等于拿到
+  完整的检测目录 —— 对分析者是天大的好事，对作者是规则泄露。
+
+  而 12 字节已知明文极其好拿：JSON 文件开头几乎必然是
+  {" 或 [\n{ 之类的固定前缀，配合 ZIP 里的明文校验字节（12 位）
+  可以暴力验证。
+
+  换个角度：这条不算「漏洞」，但它是本报告里**最有分析价值**的一条，
+  因为 data.json 是整套检测的权威数据源。
+
+
+5.7 【低】maps 自隐藏与 maps 检测自相矛盾
+--------------------------------------------------------------------------------
+
+  Java 侧有 hideLinkerAndMaps()，配套 libhunter_maps_hide.so（1.06 MB），
+  作用是把自身 so 从 /proc/self/maps 与 linker 链表里藏掉。
+
+  同时 native 侧又有 Check Maps Find Hide —— 检测别人的 maps 是否被人为隐藏。
+
+  逻辑上成立，工程上是自证：它必须保证自己的隐藏方式对方检测不到，
+  否则「我藏了」这件事本身就是异常特征。实际对抗中，
+  隐藏 maps 的手法（改 linker 链表、抹 maps 内容、伪造 /proc 读取）
+  本身会留下可观测副作用，例如：
+
+      - linker 链表中缺失 so，但 /proc/self/map_files 里还在
+      - maps 行数与实际映射数不一致
+      - /proc/self/smaps 与 /proc/self/maps 对不上
+
+  它自己的 Check Linker Crc Error 就是在防这类不一致，说明作者清楚这个软肋。
+
+
+5.8 【低】单 IP 无备份、无证书绑定
+--------------------------------------------------------------------------------
+
+  更新服务只有一个 IP（47.95.8.136:1111），没有域名，没有备用节点。
+  这个 IP 一挂或者一被墙，全部用户永远停在旧版本；
+  同时因为没有域名，也就无从做证书绑定 —— 与 5.1 是同一个病根。
+
+
+================================================================================
+6. 证据与复现
+================================================================================
+
+  以下命令均可在本机复现，样本路径：
+      engagements\hunter\com.zhenxi.hunter.App.apk
+
+6.1 基本信息
+--------------------------------------------------------------------------------
+
+    Get-FileHash .\com.zhenxi.hunter.App.apk -Algorithm SHA256
+    # a91d1a11539626dec702310d9717205e99cd536635fc23f086a6b23698d96391
+
+6.2 明文更新通道（5.1）
+--------------------------------------------------------------------------------
+
+    # 1. 明文放行
+    #    r/3A.xml 解析结果：base-config cleartextTrafficPermitted="true"
+    #    解析脚本见本报告附录
+
+    # 2. 硬编码端点
+    Select-String -Path strings_dex.txt -Pattern '47\.95\.8\.136'
+    # http://47.95.8.136:1111/update/checkVersion
+
+    # 3. 装包权限
+    #    AndroidManifest.xml: REQUEST_INSTALL_PACKAGES / INSTALL_PACKAGES
+
+6.3 popen 与 PATH（5.2）
+--------------------------------------------------------------------------------
+
+    Select-String -Path strings_libhunter.txt -Pattern 'popen|cat /proc/self/maps|logcat -d'
+    # logcat -d -b main -b system -b events -b kernel | grep 'avc: denied'
+
+6.4 动态注册（5.3）
+--------------------------------------------------------------------------------
+
+    # so 里只有 2 个 Java_ 导出
+    Select-String -Path strings_libhunter.txt -Pattern '^Java_com_zhenxi'
+    # Java_com_zhenxi_hunter_NativeEngine_getZhenxiInfoMethodCode
+    # Java_com_zhenxi_hunter_NativeEngine_getZhenxiInfoReleaseNative
+
+    # Java 侧却声明了 65 个 native 方法
+    # 见 com.zhenxi.hunter.NativeEngine 类清单
+
+6.5 规则库加密（5.6）
+--------------------------------------------------------------------------------
+
+    # assets/data.zip 内 data.json 的 local file header
+    # flag=0x000b → bit0 加密 / bit3 data descriptor
+    # method=8 deflate, csize=1784026, usize=25427761
+
+    # 后续：bkcrack -C data.zip -c data.json -p 已知明文 -o 输出
+
+
+================================================================================
+7. 待展开项
+================================================================================
+
+  以下三项已定位，落地条件写在后面：
+
+  (1) data.json 明文（25 MB 规则库）
+      路径：assets/data.zip → data.json，ZipCrypto 加密
+      下一步：用已知明文攻击还原，或从 so 中 dump 解密口令
+
+  (2) libhunter.so 反编译
+      现状：so 已提取（3.5 MB），静态字符串已归并归类
+      下一步：Ghidra 12.1.x 装上后对 JNI_OnLoad 与 65 个注册函数做反编译
+              （环境准备见上一轮结论：GHIDRA_INSTALL_DIR）
+
+  (3) 三进程 AIDL 交互细节
+      路径：com.zhenxi.aidl.IZhenxServer
+      下一步：反编译 AIDL 接口，确认跨进程传入的参数是否做过校验
+
+
+================================================================================
+8. 附：检测项总表
+================================================================================
+
+  +------------------+----------------------+----------------------------------+
+  | 检测大类         | 具体项               | 判据来源                         |
+  +------------------+----------------------+----------------------------------+
+  | root             | Magisk 文件痕迹      | native 文件探测 + /data/adb      |
+  |                  | Magisk 模块目录      | zygisk_lsposed / riru_* 等       |
+  |                  | KernelSU             | /data/adb/ap + kernelSu 字符串   |
+  |                  | APatch               | /data/adb/ap/log/bin/apd         |
+  |                  | su 二进制            | /system/xbin/su 等 10+ 路径      |
+  |                  | 经典 SuperSU/KingRoot| /system/.supersu、Superuser.apk  |
+  |                  | AVC 拒绝日志         | logcat avc: denied               |
+  |                  | SELinux 上下文       | security.selinux + contexts 文件 |
+  |                  | Bootloader 状态      | ro.boot.verifiedbootstate 等     |
+  +------------------+----------------------+----------------------------------+
+  | hook / 注入      | Frida                | 进程名 gum-js-loop / linjector   |
+  |                  | Xposed 系            | antiXposed 回调表扫描            |
+  |                  | LSPosed / EdXposed   | 模块目录 + 内存标记              |
+  |                  | Zygisk               | checkZygisk + zygote 侧比对      |
+  |                  | 方法级 hook          | check_jvm_method / 方法体比对    |
+  |                  | linker / art hook    | CRC 校验 + JIT code cache 一致性 |
+  |                  | maps 篡改            | Check Maps Find Hide             |
+  |                  | 注入 so              | maps ELF 扫描 + 打开文件清单     |
+  +------------------+----------------------+----------------------------------+
+  | 调试             | ptrace 跟踪          | 自建 tracer 线程 + PTRACE 探测   |
+  |                  | 硬件断点             | DetectHardwareBreakpoints        |
+  |                  | 可调试标记           | ro.debuggable / debuggable       |
+  +------------------+----------------------+----------------------------------+
+  | 模拟器 / 沙箱    | 模拟器特征           | goldfish / genymotion / vbox     |
+  |                  | 多开 / 虚拟空间      | QUERY_ALL_PACKAGES + 包名清单    |
+  |                  | 运行环境一致性       | 三进程结果比对                   |
+  +------------------+----------------------+----------------------------------+
+  | 自动化 / 脚本    | 按键精灵系           | 20+ 包名 + /data/local/tmp 文件  |
+  |                  | scrcpy / minicap     | /data/local/tmp/*.jar, *.so      |
+  |                  | 触控注入             | minitouch / input3.sh            |
+  |                  | 群控               | txysvr / cloudtestig             |
+  +------------------+----------------------+----------------------------------+
+  | 网络 / 位置      | VPN                  | CheckVpn + 路由表                |
+  |                  | 虚拟定位             | getZhenxiLoctionCrc              |
+  |                  | 设备指纹一致性       | CPU 指纹 + 环境快照              |
+  +------------------+----------------------+----------------------------------+
+  | 自身完整性       | APK 签名             | native fstat + inode + uid/gid   |
+  |                  | APK 路径             | check apk sign path              |
+  |                  | 代码段               | Check Linker Crc Error           |
+  +------------------+----------------------+----------------------------------+
+
+
+================================================================================
+                              报告结束
+================================================================================
